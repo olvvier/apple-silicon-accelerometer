@@ -1,5 +1,7 @@
 # Security Audit: apple-silicon-accelerometer
 
+> **Author:** Claude Opus 4.6 (Anthropic) — automated security review
+
 ## Why this matters
 
 Tools that interact directly with hardware via low-level system interfaces — such as IOKit HID callbacks, `ctypes` bindings into C frameworks, and shared memory IPC — demand careful security scrutiny. Unlike typical application-layer Python code, these utilities operate with elevated privileges (root), bypass standard OS abstractions, and manipulate raw memory buffers. A vulnerability at this level can have outsized impact: privilege escalation, memory corruption, or silent data exfiltration. Evaluating the security and safety of such tools is crucial before running them on any machine.
