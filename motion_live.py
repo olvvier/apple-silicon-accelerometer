@@ -22,7 +22,7 @@ from collections import deque
 
 import struct
 
-from spu_sensor import (
+from macimu._spu import (
     sensor_worker, shm_read_new, shm_read_new_gyro, shm_snap_read,
     SHM_NAME, SHM_NAME_GYRO, SHM_SIZE,
     SHM_NAME_ALS, SHM_ALS_SIZE, SHM_NAME_LID, SHM_LID_SIZE,

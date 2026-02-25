@@ -8,3 +8,5 @@
 .env
 __pycache__/
 uv.lock
+dist/
+build/

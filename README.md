@@ -4,6 +4,26 @@ reads the undocumented internal accelerometer + gyroscope on apple silicon macbo
 
 more information: [read the article](https://medium.com/@oli.bourbonnais/your-macbook-has-an-accelerometer-and-you-can-read-it-in-real-time-in-python-28d9395fb180)
 
+it turns out modern macbook pros have an undocumented mems accelerometer + gyroscope managed by the sensor processing unit (spu).
+this project reads both via iokit hid, along with lid angle and ambient light sensors from the same interface
+
+## install
+
+    pip install macimu
+
+```python
+from macimu import IMU
+
+with IMU() as imu:
+    accel = imu.latest_accel()       # Sample(x, y, z) in g
+    gyro = imu.latest_gyro()         # Sample(x, y, z) in deg/s
+
+    for s in imu.read_accel():       # all new samples since last call
+        print(s.x, s.y, s.z)
+```
+
+requires root (sudo) because iokit hid device access needs elevated privileges.
+also supports `imu.read_lid()` and `imu.read_als()` -- see `macimu/__init__.py` for the full api
 
 ![demo](assets/demo.gif)
 
@@ -31,14 +51,14 @@ you can verify the device exists on your machine with:
 
     ioreg -l -w0 | grep -A5 AppleSPUHIDDevice
 
-## quick start
+## demo dashboard
 
     git clone https://github.com/olvvier/apple-silicon-accelerometer
     cd apple-silicon-accelerometer
-    pip install -e .
+    pip install -e .[demo]
     sudo python3 motion_live.py
 
-requires root because iokit hid device access on apple silicon needs elevated privileges
+the demo includes vibration detection, orientation gauges, experimental heartbeat (bcg), lid angle, ambient light, and optional keyboard flash
 
 ### keyboard flash mode (bundled KBPulse)
 
@@ -62,11 +82,9 @@ If you have `uv`/`uvx` installed, you can also just
 
 ## code structure
 
-- spu_sensor.py - the core: iokit bindings, device discovery, accel + gyro + lid angle + ambient light hid callbacks, shared memory ring buffers
-- motion_live.py - vibration detection pipeline, heartbeat bcg, terminal ui, main loop
+- macimu/ - python package (`pip install macimu`): high-level IMU class + low-level iokit bindings, shared memory ring buffers
+- motion_live.py - demo app: vibration detection, heartbeat bcg, terminal ui
 - KBPulse/ - vendored keyboard backlight driver code + binary (`KBPulse/bin/KBPulse`)
-
-the sensor reading logic is isolated in spu_sensor.py so you can reuse it independently
 
 ## heartbeat demo
 
