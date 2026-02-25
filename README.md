@@ -53,8 +53,9 @@ you can verify the device exists on your machine with:
 
     git clone https://github.com/olvvier/apple-silicon-accelerometer
     cd apple-silicon-accelerometer
+    python3 -m venv .venv && source .venv/bin/activate
     pip install -e .[demo]
-    sudo python3 motion_live.py
+    sudo .venv/bin/python3 motion_live.py
 
 the demo includes vibration detection, orientation gauges, experimental heartbeat (bcg), lid angle, ambient light, and optional keyboard flash
 
