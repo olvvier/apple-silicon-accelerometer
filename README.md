@@ -105,6 +105,14 @@ the bcg bandpass is 0.8-3hz and bpm is estimated via autocorrelation on the filt
 - macbook pro m3 pro, macos 15.6.1
 - python 3.14
 
+
+## known incompatible
+
+- intel macs (no spu)
+- m1 macbook pro (2020)
+- mac studio m4 max 
+
+
 ## license
 
 MIT
