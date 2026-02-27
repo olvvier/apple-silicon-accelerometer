@@ -9,6 +9,10 @@ this project reads both via iokit hid, along with lid angle and ambient light se
 
     pip install macimu
 
+if you get `externally-managed-environment` (homebrew python), use a venv:
+
+    python3 -m venv .venv && source .venv/bin/activate && pip install macimu
+
 ```python
 from macimu import IMU
 

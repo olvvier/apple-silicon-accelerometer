@@ -168,27 +168,33 @@ def _iokit_enumerate():
     _cf.CFStringGetCString.restype = ctypes.c_bool
     _cf.CFStringGetCString.argtypes = [
         ctypes.c_void_p, ctypes.c_char_p, ctypes.c_long, ctypes.c_uint32]
-    _cf.CFStringGetLength.restype = ctypes.c_long
-    _cf.CFStringGetLength.argtypes = [ctypes.c_void_p]
+    _cf.CFGetTypeID.restype = ctypes.c_ulong
+    _cf.CFGetTypeID.argtypes = [ctypes.c_void_p]
+    _cf.CFStringGetTypeID.restype = ctypes.c_ulong
+    _cf.CFStringGetTypeID.argtypes = []
+    _cf.CFNumberGetTypeID.restype = ctypes.c_ulong
+    _cf.CFNumberGetTypeID.argtypes = []
+
+    str_type_id = _cf.CFStringGetTypeID()
+    num_type_id = _cf.CFNumberGetTypeID()
 
     def cfstr(s):
         return _cf.CFStringCreateWithCString(None, s.encode(), CF_UTF8)
 
-    def prop_int(svc, k):
+    def prop_value(svc, k):
+        """Read a property, auto-detecting CFString vs CFNumber."""
         ref = _iokit.IORegistryEntryCreateCFProperty(svc, cfstr(k), None, 0)
         if not ref:
             return None
-        v = ctypes.c_long()
-        _cf.CFNumberGetValue(ref, CF_SINT64, ctypes.byref(v))
-        return v.value
-
-    def prop_str(svc, k):
-        ref = _iokit.IORegistryEntryCreateCFProperty(svc, cfstr(k), None, 0)
-        if not ref:
-            return None
-        buf = ctypes.create_string_buffer(256)
-        if _cf.CFStringGetCString(ref, buf, 256, CF_UTF8):
-            return buf.value.decode('utf-8', errors='replace')
+        tid = _cf.CFGetTypeID(ref)
+        if tid == str_type_id:
+            buf = ctypes.create_string_buffer(256)
+            if _cf.CFStringGetCString(ref, buf, 256, CF_UTF8):
+                return buf.value.decode('utf-8', errors='replace')
+        elif tid == num_type_id:
+            v = ctypes.c_long()
+            _cf.CFNumberGetValue(ref, CF_SINT64, ctypes.byref(v))
+            return v.value
         return None
 
     matching = _iokit.IOServiceMatching(b'AppleSPUHIDDevice')
@@ -202,12 +208,12 @@ def _iokit_enumerate():
         svc = _iokit.IOIteratorNext(it.value)
         if not svc:
             break
-        up = prop_int(svc, 'PrimaryUsagePage') or 0
-        u = prop_int(svc, 'PrimaryUsage') or 0
+        up = prop_value(svc, 'PrimaryUsagePage') or 0
+        u = prop_value(svc, 'PrimaryUsage') or 0
         props = {}
         for k in ('Product', 'SerialNumber', 'Manufacturer', 'Transport',
                   'VendorID', 'ProductID'):
-            v = prop_str(svc, k) or prop_int(svc, k)
+            v = prop_value(svc, k)
             if v is not None:
                 props[k] = v
         devices.append((up, u, props))
