@@ -6,6 +6,7 @@ via iokit hid (AppleSPUHIDDevice, Bosch BMI286 IMU)
 import ctypes
 import ctypes.util
 import struct
+import time
 import multiprocessing.shared_memory
 
 # hid usage pages & usages
@@ -38,9 +39,9 @@ GYRO_SCALE = 65536.0            # Q16 raw -> deg/s
 
 # ring-buffer shm layout
 #   [0..3] write_idx u32  [4..11] total u64  [12..15] restarts u32
-#   [16..] ring of RING_CAP * 12 bytes (3x i32: x, y, z)
+#   [16..] ring of RING_CAP * 20 bytes (3x i32 xyz + 1x f64 timestamp)
 RING_CAP = 8000
-RING_ENTRY = 12
+RING_ENTRY = 20
 SHM_HEADER = 16
 SHM_SIZE = SHM_HEADER + RING_CAP * RING_ENTRY
 SHM_NAME = 'vib_detect_shm'
@@ -59,6 +60,7 @@ def shm_write_sample(buf, x_raw, y_raw, z_raw):
     idx, = struct.unpack_from('<I', buf, 0)
     off = SHM_HEADER + idx * RING_ENTRY
     struct.pack_into('<iii', buf, off, x_raw, y_raw, z_raw)
+    struct.pack_into('<d', buf, off + 12, time.monotonic())
     struct.pack_into('<I', buf, 0, (idx + 1) % RING_CAP)
     total, = struct.unpack_from('<Q', buf, 4)
     struct.pack_into('<Q', buf, 4, total + 1)
@@ -100,6 +102,34 @@ def shm_read_new_gyro(buf, last_total):
     return samples, total
 
 
+def _shm_read_new_timed(buf, last_total, scale):
+    """Read new samples with monotonic timestamps."""
+    total, = struct.unpack_from('<Q', buf, 4)
+    n_new = total - last_total
+    if n_new <= 0:
+        return [], total
+    if n_new > RING_CAP:
+        n_new = RING_CAP
+    idx, = struct.unpack_from('<I', buf, 0)
+    samples = []
+    start = (idx - n_new) % RING_CAP
+    for i in range(n_new):
+        pos = (start + i) % RING_CAP
+        off = SHM_HEADER + pos * RING_ENTRY
+        x, y, z = struct.unpack_from('<iii', buf, off)
+        t, = struct.unpack_from('<d', buf, off + 12)
+        samples.append((t, x / scale, y / scale, z / scale))
+    return samples, total
+
+
+def shm_read_new_accel_timed(buf, last_total):
+    return _shm_read_new_timed(buf, last_total, ACCEL_SCALE)
+
+
+def shm_read_new_gyro_timed(buf, last_total):
+    return _shm_read_new_timed(buf, last_total, GYRO_SCALE)
+
+
 def shm_snap_write(buf, payload):
     buf[SHM_SNAP_HDR:SHM_SNAP_HDR + len(payload)] = payload
     cnt, = struct.unpack_from('<I', buf, 0)
@@ -113,8 +143,108 @@ def shm_snap_read(buf, last_count, payload_len):
     return bytes(buf[SHM_SNAP_HDR:SHM_SNAP_HDR + payload_len]), cnt
 
 
+def _iokit_enumerate():
+    """Enumerate SPU HID devices (no root needed). Returns list of (usage_page, usage, properties)."""
+    _iokit = ctypes.cdll.LoadLibrary(ctypes.util.find_library('IOKit'))
+    _cf = ctypes.cdll.LoadLibrary(ctypes.util.find_library('CoreFoundation'))
+
+    _iokit.IOServiceMatching.restype = ctypes.c_void_p
+    _iokit.IOServiceMatching.argtypes = [ctypes.c_char_p]
+    _iokit.IOServiceGetMatchingServices.restype = ctypes.c_int
+    _iokit.IOServiceGetMatchingServices.argtypes = [
+        ctypes.c_uint, ctypes.c_void_p, ctypes.POINTER(ctypes.c_uint)]
+    _iokit.IOIteratorNext.restype = ctypes.c_uint
+    _iokit.IOIteratorNext.argtypes = [ctypes.c_uint]
+    _iokit.IOObjectRelease.argtypes = [ctypes.c_uint]
+    _iokit.IORegistryEntryCreateCFProperty.restype = ctypes.c_void_p
+    _iokit.IORegistryEntryCreateCFProperty.argtypes = [
+        ctypes.c_uint, ctypes.c_void_p, ctypes.c_void_p, ctypes.c_uint]
+
+    _cf.CFStringCreateWithCString.restype = ctypes.c_void_p
+    _cf.CFStringCreateWithCString.argtypes = [
+        ctypes.c_void_p, ctypes.c_char_p, ctypes.c_uint32]
+    _cf.CFNumberGetValue.restype = ctypes.c_bool
+    _cf.CFNumberGetValue.argtypes = [ctypes.c_void_p, ctypes.c_int, ctypes.c_void_p]
+    _cf.CFStringGetCString.restype = ctypes.c_bool
+    _cf.CFStringGetCString.argtypes = [
+        ctypes.c_void_p, ctypes.c_char_p, ctypes.c_long, ctypes.c_uint32]
+    _cf.CFStringGetLength.restype = ctypes.c_long
+    _cf.CFStringGetLength.argtypes = [ctypes.c_void_p]
+
+    def cfstr(s):
+        return _cf.CFStringCreateWithCString(None, s.encode(), CF_UTF8)
+
+    def prop_int(svc, k):
+        ref = _iokit.IORegistryEntryCreateCFProperty(svc, cfstr(k), None, 0)
+        if not ref:
+            return None
+        v = ctypes.c_long()
+        _cf.CFNumberGetValue(ref, CF_SINT64, ctypes.byref(v))
+        return v.value
+
+    def prop_str(svc, k):
+        ref = _iokit.IORegistryEntryCreateCFProperty(svc, cfstr(k), None, 0)
+        if not ref:
+            return None
+        buf = ctypes.create_string_buffer(256)
+        if _cf.CFStringGetCString(ref, buf, 256, CF_UTF8):
+            return buf.value.decode('utf-8', errors='replace')
+        return None
+
+    matching = _iokit.IOServiceMatching(b'AppleSPUHIDDevice')
+    it = ctypes.c_uint()
+    kr = _iokit.IOServiceGetMatchingServices(0, matching, ctypes.byref(it))
+    if kr != 0:
+        return []
+
+    devices = []
+    while True:
+        svc = _iokit.IOIteratorNext(it.value)
+        if not svc:
+            break
+        up = prop_int(svc, 'PrimaryUsagePage') or 0
+        u = prop_int(svc, 'PrimaryUsage') or 0
+        props = {}
+        for k in ('Product', 'SerialNumber', 'Manufacturer', 'Transport',
+                  'VendorID', 'ProductID'):
+            v = prop_str(svc, k) or prop_int(svc, k)
+            if v is not None:
+                props[k] = v
+        devices.append((up, u, props))
+        _iokit.IOObjectRelease(svc)
+    return devices
+
+
+def check_available():
+    """Return True if the SPU accelerometer is present (no root needed)."""
+    try:
+        return any(
+            (up, u) == (PAGE_VENDOR, USAGE_ACCEL)
+            for up, u, _ in _iokit_enumerate()
+        )
+    except Exception:
+        return False
+
+
+def get_device_info():
+    """Return dict of SPU device metadata (no root needed)."""
+    info = {'sensors': []}
+    usage_names = {
+        (PAGE_VENDOR, USAGE_ACCEL): 'accelerometer',
+        (PAGE_VENDOR, USAGE_GYRO): 'gyroscope',
+        (PAGE_VENDOR, USAGE_ALS): 'ambient_light',
+        (PAGE_SENSOR, USAGE_LID): 'lid_angle',
+    }
+    for up, u, props in _iokit_enumerate():
+        name = usage_names.get((up, u))
+        if name:
+            info['sensors'].append(name)
+            info.update(props)
+    return info
+
+
 def sensor_worker(shm_name, restart_count, gyro_shm_name=None,
-                   als_shm_name=None, lid_shm_name=None):
+                   als_shm_name=None, lid_shm_name=None, decimation=None):
     _iokit = ctypes.cdll.LoadLibrary(ctypes.util.find_library('IOKit'))
     _cf = ctypes.cdll.LoadLibrary(ctypes.util.find_library('CoreFoundation'))
 
@@ -195,6 +325,8 @@ def sensor_worker(shm_name, restart_count, gyro_shm_name=None,
             name=lid_shm_name, create=False)
         lid_buf = lid_shm.buf
 
+    dec_n = decimation if decimation is not None else IMU_DECIMATION
+
     _REPORT_CB = ctypes.CFUNCTYPE(
         None, ctypes.c_void_p, ctypes.c_int, ctypes.c_void_p,
         ctypes.c_int, ctypes.c_uint32,
@@ -207,7 +339,7 @@ def sensor_worker(shm_name, restart_count, gyro_shm_name=None,
         try:
             if length == IMU_REPORT_LEN:
                 accel_dec[0] += 1
-                if accel_dec[0] < IMU_DECIMATION:
+                if accel_dec[0] < dec_n:
                     return
                 accel_dec[0] = 0
                 data = bytes(rpt[:IMU_REPORT_LEN])
@@ -229,7 +361,7 @@ def sensor_worker(shm_name, restart_count, gyro_shm_name=None,
             try:
                 if length == IMU_REPORT_LEN:
                     gyro_dec[0] += 1
-                    if gyro_dec[0] < IMU_DECIMATION:
+                    if gyro_dec[0] < dec_n:
                         return
                     gyro_dec[0] = 0
                     data = bytes(rpt[:IMU_REPORT_LEN])

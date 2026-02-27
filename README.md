@@ -21,7 +21,97 @@ with IMU() as imu:
 ```
 
 requires root (sudo) because iokit hid device access needs elevated privileges
-also supports `imu.read_lid()` and `imu.read_als()` see `macimu/__init__.py` for the full api
+
+### check if sensor exists (no root needed)
+
+```python
+from macimu import IMU
+print(IMU.available())   # True on macbook pro m2+
+```
+
+### real-time orientation (roll / pitch / yaw)
+
+fuses accel + gyro with a mahony quaternion filter, no math needed on your side
+
+```python
+with IMU(orientation=True) as imu:
+    o = imu.orientation()
+    print(f"{o.roll:.1f}° {o.pitch:.1f}° {o.yaw:.1f}°")
+    print(o.qw, o.qx, o.qy, o.qz)  # raw quaternion
+```
+
+### timestamped samples for logging / replay
+
+```python
+with IMU() as imu:
+    for s in imu.read_accel_timed():
+        print(f"t={s.t:.4f}  x={s.x:.3f}  y={s.y:.3f}  z={s.z:.3f}")
+```
+
+### streaming with callback
+
+```python
+def on_sample(s):
+    print(s.x, s.y, s.z)
+
+with IMU() as imu:
+    stop = imu.on_accel(on_sample)  # background thread
+    time.sleep(10)
+    stop()                          # unregister
+```
+
+### sample rate control
+
+```python
+IMU(decimation=1)   # ~800 hz (full native rate)
+IMU(decimation=8)   # ~100 hz (default)
+IMU(decimation=16)  # ~50 hz
+```
+
+### api reference
+
+**constructor**
+
+    IMU(accel=True, gyro=True, als=False, lid=False, orientation=False, decimation=8)
+
+**class methods** (no root needed)
+
+| method | returns | description |
+|--------|---------|-------------|
+| `IMU.available()` | `bool` | check if sensor exists |
+| `IMU.device_info()` | `dict` | sensors list, serial, product name |
+
+**reading data**
+
+| method | returns | description |
+|--------|---------|-------------|
+| `imu.read_accel()` | `list[Sample]` | new samples since last call (x, y, z in g) |
+| `imu.read_gyro()` | `list[Sample]` | new samples since last call (x, y, z in deg/s) |
+| `imu.read_accel_timed()` | `list[TimedSample]` | same with monotonic timestamp (t, x, y, z) |
+| `imu.read_gyro_timed()` | `list[TimedSample]` | same for gyro |
+| `imu.latest_accel()` | `Sample \| None` | most recent sample |
+| `imu.latest_gyro()` | `Sample \| None` | most recent sample |
+
+**orientation & sensors**
+
+| method | returns | description |
+|--------|---------|-------------|
+| `imu.orientation()` | `Orientation \| None` | roll, pitch, yaw (deg) + quaternion |
+| `imu.read_lid()` | `float \| None` | lid angle in degrees |
+| `imu.read_als()` | `ALSReading \| None` | lux + 4 spectral channels |
+
+**streaming**
+
+| method | returns | description |
+|--------|---------|-------------|
+| `imu.stream_accel()` | generator | blocking, yields `Sample` |
+| `imu.stream_gyro()` | generator | blocking, yields `Sample` |
+| `imu.on_accel(callback)` | `stop_fn` | background thread, call `stop()` to end |
+| `imu.on_gyro(callback)` | `stop_fn` | background thread, call `stop()` to end |
+
+**lifecycle**: `imu.start()` / `imu.stop()` or use `with IMU() as imu:`
+
+**exceptions**: `macimu.SensorNotFound` if no SPU device, `PermissionError` if not root
 
 ![demo](https://raw.githubusercontent.com/olvvier/apple-silicon-accelerometer/main/assets/demo.gif)
 
