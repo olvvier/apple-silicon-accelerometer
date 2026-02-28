@@ -56,11 +56,11 @@ SHM_ALS_SIZE = SHM_SNAP_HDR + ALS_REPORT_LEN
 SHM_LID_SIZE = SHM_SNAP_HDR + 4
 
 
-def shm_write_sample(buf, x_raw, y_raw, z_raw):
+def shm_write_sample(buf, x_raw, y_raw, z_raw, timestamp=None):
     idx, = struct.unpack_from('<I', buf, 0)
     off = SHM_HEADER + idx * RING_ENTRY
     struct.pack_into('<iii', buf, off, x_raw, y_raw, z_raw)
-    struct.pack_into('<d', buf, off + 12, time.monotonic())
+    struct.pack_into('<d', buf, off + 12, timestamp if timestamp is not None else time.monotonic())
     struct.pack_into('<I', buf, 0, (idx + 1) % RING_CAP)
     total, = struct.unpack_from('<Q', buf, 4)
     struct.pack_into('<Q', buf, 4, total + 1)
@@ -250,9 +250,11 @@ def get_device_info():
 
 
 def sensor_worker(shm_name, restart_count, gyro_shm_name=None,
-                   als_shm_name=None, lid_shm_name=None, decimation=None):
+                   als_shm_name=None, lid_shm_name=None, decimation=None,
+                   shutdown_event=None):
     _iokit = ctypes.cdll.LoadLibrary(ctypes.util.find_library('IOKit'))
     _cf = ctypes.cdll.LoadLibrary(ctypes.util.find_library('CoreFoundation'))
+    _libc = ctypes.cdll.LoadLibrary(ctypes.util.find_library('c'))
 
     kCFAllocatorDefault = ctypes.c_void_p.in_dll(_cf, 'kCFAllocatorDefault')
     kCFRunLoopDefaultMode = ctypes.c_void_p.in_dll(_cf, 'kCFRunLoopDefaultMode')
@@ -275,8 +277,8 @@ def sensor_worker(shm_name, restart_count, gyro_shm_name=None,
     _iokit.IOHIDDeviceCreate.argtypes = [ctypes.c_void_p, ctypes.c_uint]
     _iokit.IOHIDDeviceOpen.restype = ctypes.c_int
     _iokit.IOHIDDeviceOpen.argtypes = [ctypes.c_void_p, ctypes.c_int]
-    _iokit.IOHIDDeviceRegisterInputReportCallback.restype = None
-    _iokit.IOHIDDeviceRegisterInputReportCallback.argtypes = [
+    _iokit.IOHIDDeviceRegisterInputReportWithTimeStampCallback.restype = None
+    _iokit.IOHIDDeviceRegisterInputReportWithTimeStampCallback.argtypes = [
         ctypes.c_void_p, ctypes.c_void_p, ctypes.c_long,
         ctypes.c_void_p, ctypes.c_void_p]
     _iokit.IOHIDDeviceScheduleWithRunLoop.restype = None
@@ -293,6 +295,19 @@ def sensor_worker(shm_name, restart_count, gyro_shm_name=None,
     _cf.CFRunLoopGetCurrent.restype = ctypes.c_void_p
     _cf.CFRunLoopRunInMode.restype = ctypes.c_int32
     _cf.CFRunLoopRunInMode.argtypes = [ctypes.c_void_p, ctypes.c_double, ctypes.c_bool]
+    _cf.CFRunLoopStop.restype = None
+    _cf.CFRunLoopStop.argtypes = [ctypes.c_void_p]
+
+    # mach_absolute_time -> seconds conversion
+    class _MachTimebaseInfo(ctypes.Structure):
+        _fields_ = [('numer', ctypes.c_uint32), ('denom', ctypes.c_uint32)]
+
+    _libc.mach_timebase_info.restype = ctypes.c_int
+    _libc.mach_timebase_info.argtypes = [ctypes.POINTER(_MachTimebaseInfo)]
+
+    tb = _MachTimebaseInfo()
+    _libc.mach_timebase_info(ctypes.byref(tb))
+    mach_to_sec = (tb.numer / tb.denom) * 1e-9
 
     def cfstr(s):
         return _cf.CFStringCreateWithCString(None, s.encode(), CF_UTF8)
@@ -332,16 +347,21 @@ def sensor_worker(shm_name, restart_count, gyro_shm_name=None,
         lid_buf = lid_shm.buf
 
     dec_n = decimation if decimation is not None else IMU_DECIMATION
+    _shutting_down = [False]
 
-    _REPORT_CB = ctypes.CFUNCTYPE(
+    # timestamped callback: includes uint64 mach_absolute_time per report
+    _TS_REPORT_CB = ctypes.CFUNCTYPE(
         None, ctypes.c_void_p, ctypes.c_int, ctypes.c_void_p,
         ctypes.c_int, ctypes.c_uint32,
         ctypes.POINTER(ctypes.c_uint8), ctypes.c_long,
+        ctypes.c_uint64,
     )
 
     accel_dec = [0]
 
-    def on_accel_report(ctx, result, sender, rtype, rid, rpt, length):
+    def on_accel_report(ctx, result, sender, rtype, rid, rpt, length, ts):
+        if _shutting_down[0]:
+            return
         try:
             if length == IMU_REPORT_LEN:
                 accel_dec[0] += 1
@@ -353,17 +373,19 @@ def sensor_worker(shm_name, restart_count, gyro_shm_name=None,
                 x = struct.unpack('<i', data[o:o + 4])[0]
                 y = struct.unpack('<i', data[o + 4:o + 8])[0]
                 z = struct.unpack('<i', data[o + 8:o + 12])[0]
-                shm_write_sample(accel_buf, x, y, z)
+                shm_write_sample(accel_buf, x, y, z, ts * mach_to_sec)
         except Exception:
             pass
 
-    accel_cb_ref = _REPORT_CB(on_accel_report)
+    accel_cb_ref = _TS_REPORT_CB(on_accel_report)
 
     gyro_dec = [0]
     gyro_cb_ref = None
 
     if gyro_buf is not None:
-        def on_gyro_report(ctx, result, sender, rtype, rid, rpt, length):
+        def on_gyro_report(ctx, result, sender, rtype, rid, rpt, length, ts):
+            if _shutting_down[0]:
+                return
             try:
                 if length == IMU_REPORT_LEN:
                     gyro_dec[0] += 1
@@ -375,26 +397,30 @@ def sensor_worker(shm_name, restart_count, gyro_shm_name=None,
                     x = struct.unpack('<i', data[o:o + 4])[0]
                     y = struct.unpack('<i', data[o + 4:o + 8])[0]
                     z = struct.unpack('<i', data[o + 8:o + 12])[0]
-                    shm_write_sample(gyro_buf, x, y, z)
+                    shm_write_sample(gyro_buf, x, y, z, ts * mach_to_sec)
             except Exception:
                 pass
 
-        gyro_cb_ref = _REPORT_CB(on_gyro_report)
+        gyro_cb_ref = _TS_REPORT_CB(on_gyro_report)
 
     als_cb_ref = None
     if als_buf is not None:
-        def on_als_report(ctx, result, sender, rtype, rid, rpt, length):
+        def on_als_report(ctx, result, sender, rtype, rid, rpt, length, ts):
+            if _shutting_down[0]:
+                return
             try:
                 if length == ALS_REPORT_LEN:
                     shm_snap_write(als_buf, bytes(rpt[:ALS_REPORT_LEN]))
             except Exception:
                 pass
 
-        als_cb_ref = _REPORT_CB(on_als_report)
+        als_cb_ref = _TS_REPORT_CB(on_als_report)
 
     lid_cb_ref = None
     if lid_buf is not None:
-        def on_lid_report(ctx, result, sender, rtype, rid, rpt, length):
+        def on_lid_report(ctx, result, sender, rtype, rid, rpt, length, ts):
+            if _shutting_down[0]:
+                return
             try:
                 if length >= LID_REPORT_LEN:
                     data = bytes(rpt[:length])
@@ -407,7 +433,7 @@ def sensor_worker(shm_name, restart_count, gyro_shm_name=None,
             except Exception:
                 pass
 
-        lid_cb_ref = _REPORT_CB(on_lid_report)
+        lid_cb_ref = _TS_REPORT_CB(on_lid_report)
 
     # wake the SPU drivers
     matching = _iokit.IOServiceMatching(b'AppleSPUHIDDriver')
@@ -452,7 +478,7 @@ def sensor_worker(shm_name, restart_count, gyro_shm_name=None,
                 if kr == 0:
                     rb = (ctypes.c_uint8 * REPORT_BUF_SZ)()
                     gc_roots.append(rb)
-                    _iokit.IOHIDDeviceRegisterInputReportCallback(
+                    _iokit.IOHIDDeviceRegisterInputReportWithTimeStampCallback(
                         hid, rb, REPORT_BUF_SZ, cb, None)
                     _iokit.IOHIDDeviceScheduleWithRunLoop(
                         hid, _cf.CFRunLoopGetCurrent(), kCFRunLoopDefaultMode)
@@ -461,4 +487,7 @@ def sensor_worker(shm_name, restart_count, gyro_shm_name=None,
     gc_roots.extend([accel_cb_ref, gyro_cb_ref, als_cb_ref, lid_cb_ref])
 
     while True:
-        _cf.CFRunLoopRunInMode(kCFRunLoopDefaultMode, 1.0, False)
+        if shutdown_event and shutdown_event.is_set():
+            _shutting_down[0] = True
+            break
+        _cf.CFRunLoopRunInMode(kCFRunLoopDefaultMode, 0.5, False)
