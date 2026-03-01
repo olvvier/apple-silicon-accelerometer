@@ -2,13 +2,15 @@
 
 from __future__ import annotations
 
-__version__ = "0.1.1"
+__version__ = "0.2.0"
 
+import atexit
+import csv
+import math
 import os
 import struct
 import time
 import threading
-import multiprocessing
 import multiprocessing.shared_memory
 from collections import namedtuple
 from typing import Callable, Generator, Optional
@@ -27,11 +29,13 @@ from ._spu import (
     SHM_NAME_ALS, SHM_ALS_SIZE, SHM_NAME_LID, SHM_LID_SIZE,
     SHM_SNAP_HDR, ALS_REPORT_LEN,
     ACCEL_SCALE, GYRO_SCALE,
+    IMU_DECIMATION,
 )
 from .orientation import MahonyAHRS
 
 _ALS_LUX_OFF = 40
 _ALS_CH_OFFSETS = [20, 24, 28, 32]
+_NATIVE_RATE_HZ = 800
 
 
 class SensorNotFound(RuntimeError):
@@ -42,7 +46,7 @@ class SensorNotFound(RuntimeError):
 class IMU:
     """High-level interface to the Apple Silicon SPU IMU.
 
-    Requires root privileges (sudo). Spawns a background worker process
+    Requires root privileges (sudo). Spawns a background worker thread
     that reads HID reports and writes samples to shared memory.
 
     Parameters
@@ -58,14 +62,26 @@ class IMU:
     orientation : bool
         Enable real-time orientation fusion via Mahony AHRS (default False).
         Requires both accel and gyro to be enabled.
-    decimation : int
+    decimation : int or None
         Keep 1 in N raw HID reports. Lower = higher sample rate.
-        Default 8 gives ~100 Hz from ~800 Hz native.
+        Default 8 gives ~100 Hz from ~800 Hz native. Mutually exclusive
+        with sample_rate.
+    sample_rate : int or None
+        Desired sample rate in Hz (e.g. 200). Computes decimation
+        internally. Mutually exclusive with decimation.
     """
 
     def __init__(self, accel: bool = True, gyro: bool = True,
                  als: bool = False, lid: bool = False,
-                 orientation: bool = False, decimation: int = 8) -> None:
+                 orientation: bool = False, decimation: Optional[int] = None,
+                 sample_rate: Optional[int] = None) -> None:
+        if decimation is not None and sample_rate is not None:
+            raise ValueError("specify decimation or sample_rate, not both")
+        if sample_rate is not None:
+            decimation = max(1, round(_NATIVE_RATE_HZ / sample_rate))
+        if decimation is None:
+            decimation = IMU_DECIMATION
+
         self._want_accel = accel
         self._want_gyro = gyro
         self._want_als = als
@@ -73,7 +89,8 @@ class IMU:
         self._want_orient = orientation
         self._decimation = decimation
         self._started = False
-        self._worker: Optional[multiprocessing.Process] = None
+        self._worker: Optional[threading.Thread] = None
+        self._shutdown = threading.Event()
         self._shms: list = []
         self._shm_accel = None
         self._shm_gyro = None
@@ -83,12 +100,20 @@ class IMU:
         self._last_gyro_total = 0
         self._last_als_count = 0
         self._last_lid_count = 0
+        self._start_time = 0.0
+        self._sample_count = 0
 
         self._ahrs: Optional[MahonyAHRS] = None
         self._orient_thread: Optional[threading.Thread] = None
         self._orient_stop = threading.Event()
         self._orient_lock = threading.Lock()
         self._last_orient: Optional[Orientation] = None
+
+        self._recording_file = None
+        self._recording_writer = None
+        self._mock = False
+        self._mock_data: list = []
+        self._mock_idx = 0
 
         if orientation and not (accel and gyro):
             raise ValueError("orientation=True requires both accel=True and gyro=True")
@@ -107,9 +132,75 @@ class IMU:
         """
         return get_device_info()
 
+    @classmethod
+    def mock(cls, duration: float = 60.0, rate: int = 100,
+             noise: float = 0.01) -> IMU:
+        """Create a mock IMU with synthetic data (no root needed).
+
+        Generates sinusoidal acceleration + noise for testing.
+        """
+        instance = cls.__new__(cls)
+        instance.__init__(accel=True, gyro=True)
+        instance._mock = True
+        samples = []
+        dt = 1.0 / rate
+        for i in range(int(duration * rate)):
+            t = i * dt
+            ax = noise * (hash(('ax', i)) % 1000 / 500 - 1)
+            ay = noise * (hash(('ay', i)) % 1000 / 500 - 1)
+            az = -1.0 + noise * (hash(('az', i)) % 1000 / 500 - 1)
+            gx = 0.5 * math.sin(2 * math.pi * 0.2 * t)
+            gy = 0.3 * math.cos(2 * math.pi * 0.15 * t)
+            gz = noise * (hash(('gz', i)) % 1000 / 500 - 1)
+            samples.append((t, ax, ay, az, gx, gy, gz))
+        instance._mock_data = samples
+        instance._mock_idx = 0
+        instance._started = True
+        instance._start_time = time.monotonic()
+        instance._decimation = max(1, round(_NATIVE_RATE_HZ / rate))
+        return instance
+
+    @classmethod
+    def from_recording(cls, path: str) -> IMU:
+        """Create an IMU that replays data from a CSV file (no root needed).
+
+        CSV format: t,sensor,x,y,z (sensor = 'accel' or 'gyro').
+        """
+        instance = cls.__new__(cls)
+        instance.__init__(accel=True, gyro=True)
+        instance._mock = True
+        samples = []
+        with open(path, newline='') as f:
+            reader = csv.reader(f)
+            for row in reader:
+                if len(row) >= 5 and row[0] != 't':
+                    samples.append((
+                        float(row[0]), row[1],
+                        float(row[2]), float(row[3]), float(row[4])))
+        instance._mock_data = samples
+        instance._mock_idx = 0
+        instance._started = True
+        instance._start_time = time.monotonic()
+        return instance
+
+    @property
+    def is_running(self) -> bool:
+        """True if the sensor worker is active."""
+        return self._started
+
+    @property
+    def effective_sample_rate(self) -> Optional[float]:
+        """Measured sample rate in Hz, or None if not enough data."""
+        elapsed = time.monotonic() - self._start_time
+        if elapsed < 0.5 or self._sample_count < 10:
+            return None
+        return self._sample_count / elapsed
+
     def start(self) -> None:
-        """Start the sensor worker process. Requires root."""
+        """Start the sensor worker thread. Requires root."""
         if self._started:
+            return
+        if self._mock:
             return
         if os.geteuid() != 0:
             raise PermissionError("macimu requires root -- run with sudo")
@@ -120,7 +211,7 @@ class IMU:
         self._cleanup_stale_shm()
 
         self._shm_accel = self._create_shm(SHM_NAME, SHM_SIZE)
-        kwargs = {'decimation': self._decimation}
+        kwargs = {'decimation': self._decimation, 'shutdown_event': self._shutdown}
 
         if self._want_gyro:
             self._shm_gyro = self._create_shm(SHM_NAME_GYRO, SHM_SIZE)
@@ -132,7 +223,8 @@ class IMU:
             self._shm_lid = self._create_shm(SHM_NAME_LID, SHM_LID_SIZE)
             kwargs['lid_shm_name'] = SHM_NAME_LID
 
-        self._worker = multiprocessing.Process(
+        self._shutdown.clear()
+        self._worker = threading.Thread(
             target=sensor_worker,
             args=(SHM_NAME, 0),
             kwargs=kwargs,
@@ -140,6 +232,7 @@ class IMU:
         )
         self._worker.start()
         self._started = True
+        self._start_time = time.monotonic()
 
         if self._want_orient:
             self._ahrs = MahonyAHRS()
@@ -147,6 +240,8 @@ class IMU:
             self._orient_thread = threading.Thread(
                 target=self._orientation_loop, daemon=True)
             self._orient_thread.start()
+
+        atexit.register(self.stop)
 
     def stop(self) -> None:
         """Stop the sensor worker and free shared memory."""
@@ -156,9 +251,9 @@ class IMU:
         if self._orient_thread:
             self._orient_thread.join(timeout=2)
             self._orient_thread = None
-        if self._worker and self._worker.is_alive():
-            self._worker.kill()
-            self._worker.join(timeout=2)
+        self._shutdown.set()
+        if self._worker:
+            self._worker.join(timeout=3)
         self._worker = None
         for shm in self._shms:
             try:
@@ -172,50 +267,84 @@ class IMU:
         self._shm_als = None
         self._shm_lid = None
         self._started = False
+        if self._recording_file:
+            self._recording_file.close()
+            self._recording_file = None
+            self._recording_writer = None
+
+    def record_to(self, path: str) -> None:
+        """Start recording samples to a CSV file.
+
+        CSV format: t,sensor,x,y,z. Call stop() to flush and close.
+        """
+        self._recording_file = open(path, 'w', newline='')
+        self._recording_writer = csv.writer(self._recording_file)
+        self._recording_writer.writerow(['t', 'sensor', 'x', 'y', 'z'])
 
     def read_accel(self) -> list[Sample]:
         """Return new accelerometer samples since last call.
 
-        Returns list of Sample(x, y, z) in g.
+        Returns list of Sample(x, y, z) in g. Magnitude at rest is ~1g
+        (includes gravity).
         """
+        if self._mock:
+            return self._mock_read('accel', timed=False)
         if not self._shm_accel:
             return []
         raw, self._last_accel_total = shm_read_new(
             self._shm_accel.buf, self._last_accel_total)
-        return [Sample(*s) for s in raw]
+        samples = [Sample(*s) for s in raw]
+        self._sample_count += len(samples)
+        self._record_samples(samples, 'accel')
+        return samples
 
     def read_gyro(self) -> list[Sample]:
         """Return new gyroscope samples since last call.
 
         Returns list of Sample(x, y, z) in deg/s.
         """
+        if self._mock:
+            return self._mock_read('gyro', timed=False)
         if not self._shm_gyro:
             return []
         raw, self._last_gyro_total = shm_read_new_gyro(
             self._shm_gyro.buf, self._last_gyro_total)
-        return [Sample(*s) for s in raw]
+        samples = [Sample(*s) for s in raw]
+        self._record_samples(samples, 'gyro')
+        return samples
 
     def read_accel_timed(self) -> list[TimedSample]:
-        """Return new accelerometer samples with monotonic timestamps.
+        """Return new accelerometer samples with hardware timestamps.
 
-        Returns list of TimedSample(t, x, y, z) where t is time.monotonic().
+        Returns list of TimedSample(t, x, y, z) where t is seconds
+        from mach_absolute_time (IOKit HID report timestamp).
         """
+        if self._mock:
+            return self._mock_read('accel', timed=True)
         if not self._shm_accel:
             return []
         raw, self._last_accel_total = shm_read_new_accel_timed(
             self._shm_accel.buf, self._last_accel_total)
-        return [TimedSample(*s) for s in raw]
+        samples = [TimedSample(*s) for s in raw]
+        self._sample_count += len(samples)
+        self._record_timed_samples(samples, 'accel')
+        return samples
 
     def read_gyro_timed(self) -> list[TimedSample]:
-        """Return new gyroscope samples with monotonic timestamps.
+        """Return new gyroscope samples with hardware timestamps.
 
-        Returns list of TimedSample(t, x, y, z) where t is time.monotonic().
+        Returns list of TimedSample(t, x, y, z) where t is seconds
+        from mach_absolute_time (IOKit HID report timestamp).
         """
+        if self._mock:
+            return self._mock_read('gyro', timed=True)
         if not self._shm_gyro:
             return []
         raw, self._last_gyro_total = shm_read_new_gyro_timed(
             self._shm_gyro.buf, self._last_gyro_total)
-        return [TimedSample(*s) for s in raw]
+        samples = [TimedSample(*s) for s in raw]
+        self._record_timed_samples(samples, 'gyro')
+        return samples
 
     def latest_accel(self) -> Optional[Sample]:
         """Return most recent accelerometer Sample, or None."""
@@ -263,11 +392,35 @@ class IMU:
         channels = [struct.unpack_from('<I', raw, o)[0] for o in _ALS_CH_OFFSETS]
         return ALSReading(lux=lux, channels=channels)
 
-    def stream_accel(self, interval: float = 0.01) -> Generator[Sample, None, None]:
-        """Yield accelerometer samples as they arrive.
+    def read_all(self) -> dict:
+        """Return latest reading from all enabled sensors.
 
-        Blocks between polls. Use in a loop or a dedicated thread.
+        Returns dict with keys like 'accel', 'gyro', 'lid', 'als',
+        'orientation' (only present if enabled and data available).
         """
+        result = {}
+        a = self.latest_accel()
+        if a is not None:
+            result['accel'] = a
+        g = self.latest_gyro()
+        if g is not None:
+            result['gyro'] = g
+        if self._want_lid:
+            lid = self.read_lid()
+            if lid is not None:
+                result['lid'] = lid
+        if self._want_als:
+            als = self.read_als()
+            if als is not None:
+                result['als'] = als
+        if self._want_orient:
+            o = self.orientation()
+            if o is not None:
+                result['orientation'] = o
+        return result
+
+    def stream_accel(self, interval: float = 0.01) -> Generator[Sample, None, None]:
+        """Yield accelerometer samples as they arrive."""
         while self._started:
             for s in self.read_accel():
                 yield s
@@ -277,6 +430,20 @@ class IMU:
         """Yield gyroscope samples as they arrive."""
         while self._started:
             for s in self.read_gyro():
+                yield s
+            time.sleep(interval)
+
+    def stream_accel_timed(self, interval: float = 0.01) -> Generator[TimedSample, None, None]:
+        """Yield timestamped accelerometer samples as they arrive."""
+        while self._started:
+            for s in self.read_accel_timed():
+                yield s
+            time.sleep(interval)
+
+    def stream_gyro_timed(self, interval: float = 0.01) -> Generator[TimedSample, None, None]:
+        """Yield timestamped gyroscope samples as they arrive."""
+        while self._started:
+            for s in self.read_gyro_timed():
                 yield s
             time.sleep(interval)
 
@@ -304,6 +471,42 @@ class IMU:
         self.stop()
 
     # -- internal --
+
+    def _mock_read(self, sensor: str, timed: bool):
+        """Read from synthetic/recorded mock data."""
+        elapsed = time.monotonic() - self._start_time
+        results = []
+        while self._mock_idx < len(self._mock_data):
+            row = self._mock_data[self._mock_idx]
+            if isinstance(row, tuple) and len(row) == 7:
+                t, ax, ay, az, gx, gy, gz = row
+                if t > elapsed:
+                    break
+                self._mock_idx += 1
+                if sensor == 'accel':
+                    results.append(TimedSample(t, ax, ay, az) if timed else Sample(ax, ay, az))
+                else:
+                    results.append(TimedSample(t, gx, gy, gz) if timed else Sample(gx, gy, gz))
+            elif isinstance(row, tuple) and len(row) == 5:
+                t, s_type, x, y, z = row
+                if t > elapsed:
+                    break
+                self._mock_idx += 1
+                if s_type == sensor:
+                    results.append(TimedSample(t, x, y, z) if timed else Sample(x, y, z))
+            else:
+                self._mock_idx += 1
+        return results
+
+    def _record_samples(self, samples, sensor):
+        if self._recording_writer:
+            for s in samples:
+                self._recording_writer.writerow(['', sensor, f'{s.x:.6f}', f'{s.y:.6f}', f'{s.z:.6f}'])
+
+    def _record_timed_samples(self, samples, sensor):
+        if self._recording_writer:
+            for s in samples:
+                self._recording_writer.writerow([f'{s.t:.6f}', sensor, f'{s.x:.6f}', f'{s.y:.6f}', f'{s.z:.6f}'])
 
     def _orientation_loop(self) -> None:
         """Background thread: fuses accel+gyro into orientation quaternion."""
