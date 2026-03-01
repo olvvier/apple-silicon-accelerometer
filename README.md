@@ -28,7 +28,7 @@ only tested on macbook pro m3 pro so far - might work on other apple silicon mac
 the sensor lives under AppleSPUHIDDevice in the iokit registry, on vendor usage page 0xFF00.
 usage 3 is the accelerometer, usage 9 is the gyroscope (same physical IMU, believed to be Bosch BMI286 based on teardowns).
 the driver is AppleSPUHIDDriver which is part of the sensor processing unit.
-we open it with IOHIDDeviceCreate and register an asynchronous callback via IOHIDDeviceRegisterInputReportCallback.
+we open it with IOHIDDeviceCreate and register an asynchronous callback via IOHIDDeviceRegisterInputReportWithTimeStampCallback.
 data comes as 22-byte hid reports with x/y/z as int32 little-endian at byte offsets 6, 10, 14.
 divide by 65536 to get the value in g (accel) or deg/s (gyro).
 callback rate is ~100hz (decimated from ~800hz native)
@@ -39,7 +39,7 @@ you can verify the device exists on your machine with:
 
     ioreg -l -w0 | grep -A5 AppleSPUHIDDevice
 
-## install (beta API)
+## install
 
     pip install macimu
 
@@ -50,17 +50,49 @@ if you get `externally-managed-environment` (homebrew python), use a venv:
 ```python
 from macimu import IMU
 
-if __name__ == '__main__':
-    with IMU() as imu:
-        accel = imu.latest_accel()       # Sample(x, y, z) in g
-        gyro = imu.latest_gyro()         # Sample(x, y, z) in deg/s
+with IMU() as imu:
+    accel = imu.latest_accel()       # Sample(x, y, z) in g
+    gyro = imu.latest_gyro()         # Sample(x, y, z) in deg/s
 
-        for s in imu.read_accel():       # all new samples since last call
-            print(s.x, s.y, s.z)
+    for s in imu.read_accel():       # all new samples since last call
+        print(s.x, s.y, s.z)
 ```
 
 requires root (sudo) because iokit hid device access needs elevated privileges.
 note: accelerometer reads ~1g at rest (gravity). use `macimu.filters.remove_gravity()` to isolate dynamic acceleration.
+
+### one sample at a time (arduino-style)
+
+```python
+from macimu import IMU
+
+with IMU(sample_rate=200) as imu:
+    while True:
+        s = imu.wait_accel()         # blocks until next sample
+        print(s.x, s.y, s.z)        # per-axis access
+```
+
+### real-time streaming pipeline
+
+gravity removal, filtering, and peak detection -- all sample-by-sample, all stateful
+
+```python
+from macimu import IMU
+from macimu.filters import GravityKalman, BiquadFilter, StreamingPeakDetector, magnitude
+
+gk = GravityKalman(warmup_samples=200)
+hp = BiquadFilter('hp', 10.0, 200.0)
+pd = StreamingPeakDetector(threshold=0.15, min_spacing=30)
+
+with IMU(sample_rate=200) as imu:
+    for s in imu.stream_accel():
+        dx, dy, dz = gk.feed_remove(s.x, s.y, s.z)
+        if not gk.warmed_up:
+            continue
+        fx, fy, fz = hp.feed(dx, dy, dz)
+        if pd.feed(magnitude(fx, fy, fz)):
+            print(f"tap! z={fz:.3f}")
+```
 
 ### check if sensor exists (no root needed)
 
@@ -69,48 +101,26 @@ from macimu import IMU
 print(IMU.available())   # True on macbook pro m2+
 ```
 
-### real-time orientation (roll / pitch / yaw)
-
-fuses accel + gyro with a mahony quaternion filter, no math needed on your side
+### orientation (roll / pitch / yaw)
 
 ```python
 from macimu import IMU
 
-if __name__ == '__main__':
-    with IMU(orientation=True) as imu:
-        o = imu.orientation()
-        print(f"{o.roll:.1f}° {o.pitch:.1f}° {o.yaw:.1f}°")
-        print(o.qw, o.qx, o.qy, o.qz)  # raw quaternion
+with IMU(orientation=True) as imu:
+    o = imu.orientation()
+    print(f"{o.roll:.1f}° {o.pitch:.1f}° {o.yaw:.1f}°")
 ```
 
-### timestamped samples (hardware timestamps from iokit)
+### hardware timestamps
 
-each sample includes a precise timestamp from the hid report (mach_absolute_time),
-not a python-side clock. every report gets its own unique timestamp.
+each hid report carries its own mach_absolute_time timestamp
 
 ```python
 from macimu import IMU
 
-if __name__ == '__main__':
-    with IMU() as imu:
-        for s in imu.read_accel_timed():
-            print(f"t={s.t:.6f}  x={s.x:.3f}  y={s.y:.3f}  z={s.z:.3f}")
-```
-
-### streaming with callback
-
-```python
-import time
-from macimu import IMU
-
-def on_sample(s):
-    print(s.x, s.y, s.z)
-
-if __name__ == '__main__':
-    with IMU() as imu:
-        stop = imu.on_accel(on_sample)  # background thread
-        time.sleep(10)
-        stop()                          # unregister
+with IMU() as imu:
+    for s in imu.read_accel_timed():
+        print(f"t={s.t:.6f}  x={s.x:.3f}  y={s.y:.3f}  z={s.z:.3f}")
 ```
 
 ### sample rate control
@@ -122,48 +132,45 @@ IMU(decimation=1)     # ~800 hz (full native rate)
 IMU(decimation=8)     # ~100 hz (default)
 ```
 
-### signal processing (zero-dependency biquad butterworth filters)
+### batch signal processing
 
 ```python
 from macimu import IMU
-from macimu.filters import magnitude, remove_gravity, high_pass, low_pass, peak_detect
+from macimu.filters import magnitude, remove_gravity, high_pass, peak_detect
 
-if __name__ == '__main__':
-    with IMU() as imu:
-        samples = imu.read_accel()
-        m = magnitude(samples[0].x, samples[0].y, samples[0].z)
-        dynamic = remove_gravity(samples)               # kalman filter gravity removal
-        smooth = low_pass(samples, 5.0, 100.0)          # 2nd-order butterworth
-        taps = high_pass(samples, 10.0, 100.0, order=4) # 4th-order, -24 dB/oct
-        mags = [magnitude(s.x, s.y, s.z) for s in samples]
-        hits = peak_detect(mags, threshold=1.2)          # detect impacts
+with IMU() as imu:
+    samples = imu.read_accel()
+    dynamic = remove_gravity(samples)               # kalman gravity removal
+    taps = high_pass(samples, 10.0, 100.0, order=4) # 4th-order butterworth
+    mags = [magnitude(s.x, s.y, s.z) for s in samples]
+    hits = peak_detect(mags, threshold=1.2)          # detect impacts
 ```
 
-### mock mode (no root needed, for development / testing)
+all batch filters return `Sample(x, y, z)` namedtuples with per-axis access
+
+### mock mode (no root needed)
 
 ```python
 from macimu import IMU
 
-imu = IMU.mock(duration=10.0, rate=100)  # synthetic sinusoidal data
-for s in imu.stream_accel():
-    print(s)
+imu = IMU.mock(duration=10.0, rate=100)
+for s in imu.stream_accel():   # yields 1000 samples then stops
+    print(s.x, s.y, s.z)
 ```
 
 ### record and replay
 
 ```python
+import time
 from macimu import IMU
 
-if __name__ == '__main__':
-    # record
-    with IMU() as imu:
-        imu.record_to("session.csv")
-        time.sleep(10)
+with IMU() as imu:
+    imu.record_to("session.csv")
+    time.sleep(10)
 
-    # replay (no root needed)
-    imu = IMU.from_recording("session.csv")
-    for s in imu.stream_accel_timed():
-        print(s)
+imu = IMU.from_recording("session.csv")
+for s in imu.stream_accel_timed():
+    print(s)
 ```
 
 ### api reference
@@ -185,6 +192,8 @@ if __name__ == '__main__':
 
 | method | returns | description |
 |--------|---------|-------------|
+| `imu.wait_accel(timeout)` | `Sample \| None` | block until next sample (arduino-style) |
+| `imu.wait_gyro(timeout)` | `Sample \| None` | block until next sample |
 | `imu.read_accel()` | `list[Sample]` | new samples since last call (x, y, z in g) |
 | `imu.read_gyro()` | `list[Sample]` | new samples since last call (x, y, z in deg/s) |
 | `imu.read_accel_timed()` | `list[TimedSample]` | with hardware timestamp (t, x, y, z) |
@@ -218,24 +227,35 @@ if __name__ == '__main__':
 |-------------------|-------------|
 | `imu.start()` / `imu.stop()` | manual lifecycle (or use `with IMU() as imu:`) |
 | `imu.is_running` | `True` if worker is active |
-| `imu.effective_sample_rate` | measured hz (or `None` if not enough data) |
+| `imu.effective_sample_rate` | measured hz |
 | `imu.record_to(path)` | start writing samples to csv |
 
-**filters** (`from macimu.filters import ...`) -- biquad butterworth, zero external deps
+**streaming filter classes** (`from macimu.filters import ...`) -- stateful, one sample at a time
+
+| class | method | description |
+|-------|--------|-------------|
+| `BiquadFilter(mode, cutoff_hz, rate, order=2)` | `.feed(x,y,z)` -> `(x,y,z)` | butterworth lp/hp, maintains state between calls |
+| | `.feed_sample(s)` -> `Sample` | same but takes/returns Sample |
+| `GravityKalman(Q, R, warmup_samples=200)` | `.feed_remove(ax,ay,az)` -> `(dx,dy,dz)` | gravity subtraction in one call |
+| | `.feed_remove_sample(s)` -> `Sample` | same but takes/returns Sample |
+| | `.warmed_up` -> `bool` | True after warmup period |
+| `StreamingPeakDetector(threshold, min_spacing)` | `.feed(value)` -> `bool` | True when peak detected |
+| `StreamingRMS(window=50)` | `.feed(x,y,z)` -> `float` | rolling rms magnitude |
+
+**batch filters** (`from macimu.filters import ...`) -- all return `list[Sample]` with `.x .y .z` access
 
 | function | description |
 |----------|-------------|
 | `magnitude(x, y, z)` | euclidean magnitude |
-| `remove_gravity(samples, Q, R)` | kalman filter gravity subtraction |
-| `GravityKalman(Q, R)` | real-time gravity estimator (stateful) |
-| `low_pass(samples, cutoff_hz, rate, order=2)` | butterworth low-pass (-12 dB/oct per order of 2) |
+| `remove_gravity(samples, Q, R)` | kalman gravity subtraction |
+| `low_pass(samples, cutoff_hz, rate, order=2)` | butterworth low-pass |
 | `high_pass(samples, cutoff_hz, rate, order=2)` | butterworth high-pass |
 | `bandpass(samples, low, high, rate, order=2)` | cascaded hp + lp |
-| `filtfilt_low_pass(samples, cutoff_hz, rate)` | zero-phase lp (no lag, offline only) |
-| `filtfilt_high_pass(samples, cutoff_hz, rate)` | zero-phase hp (no lag, offline only) |
+| `filtfilt_low_pass(samples, cutoff_hz, rate)` | zero-phase lp (offline only) |
+| `filtfilt_high_pass(samples, cutoff_hz, rate)` | zero-phase hp (offline only) |
 | `median_filter(samples, window=5)` | spike / outlier removal |
 | `peak_detect(values, threshold, min_spacing)` | find peaks in 1d signal |
-| `rolling_rms(samples, window)` | rolling root-mean-square of magnitude |
+| `rolling_rms(samples, window)` | rolling rms of magnitude |
 
 **exceptions**: `macimu.SensorNotFound` if no SPU device, `PermissionError` if not root
 
