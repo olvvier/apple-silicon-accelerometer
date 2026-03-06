@@ -2,7 +2,6 @@
 """
 demo app for spu_sensor.py - vibration detection, orientation gauges,
 experimental heartbeat (bcg), lid angle & ambient light in a terminal dashboard
-requires: sudo python3 motion_live.py
 """
 
 import time
@@ -542,14 +541,6 @@ class KeyboardFlashBridge:
 
         self.bin_path = bin_path
         cmd = [bin_path, '--stdin-intensity', '--fade-ms', str(self.fade_ms)]
-        sudo_user = os.environ.get('SUDO_USER')
-        if self.run_as_user and os.geteuid() == 0 and sudo_user and sudo_user != 'root':
-            try:
-                pwd.getpwnam(sudo_user)
-                cmd = ['sudo', '-u', sudo_user] + cmd
-                self.run_user = sudo_user
-            except KeyError:
-                self.run_user = None
 
         try:
             self.proc = subprocess.Popen(
@@ -1000,13 +991,9 @@ def main():
         elif arg == '--kbpulse-as-root':
             kbpulse_as_root = True
         elif arg in ('-h', '--help'):
-            print(f'usage: sudo python3 {sys.argv[0]} [--no-kbpulse] [--kbpulse-bin /path/to/KBPulse] [--kbpulse-as-root]')
+            print(f'usage: python3 {sys.argv[0]} [--no-kbpulse] [--kbpulse-bin /path/to/KBPulse] [--kbpulse-as-root]')
             return
         i += 1
-
-    if os.geteuid() != 0:
-        print(f"\033[91m\033[1m[!] run with: sudo python3 {sys.argv[0]}\033[0m")
-        sys.exit(1)
 
     all_shms = [
         (SHM_NAME, SHM_SIZE), (SHM_NAME_GYRO, SHM_SIZE),

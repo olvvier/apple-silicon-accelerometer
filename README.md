@@ -12,8 +12,8 @@ this project reads both via iokit hid, along with lid angle and ambient light se
     git clone https://github.com/olvvier/apple-silicon-accelerometer
     cd apple-silicon-accelerometer
     python3 -m venv .venv && source .venv/bin/activate
-    pip install -e .[demo]
-    sudo .venv/bin/python3 motion_live.py
+    pip install -e ".[demo]"
+    .venv/bin/python3 motion_live.py
 
 ## what is this
 
@@ -59,7 +59,6 @@ if __name__ == '__main__':
             print(s.x, s.y, s.z)
 ```
 
-requires root (sudo) because iokit hid device access needs elevated privileges.
 note: accelerometer reads ~1g at rest (gravity). use `macimu.filters.remove_gravity()` to isolate dynamic acceleration.
 
 ### check if sensor exists (no root needed)
@@ -245,7 +244,7 @@ if __name__ == '__main__':
     cd apple-silicon-accelerometer
     python3 -m venv .venv && source .venv/bin/activate
     pip install -e .[demo]
-    sudo .venv/bin/python3 motion_live.py
+    .venv/bin/python3 motion_live.py
 
 the demo includes vibration detection, orientation gauges, experimental heartbeat (bcg), lid angle, ambient light, and optional keyboard flash
 
@@ -256,18 +255,18 @@ the repo now vendors KBPulse, including a prebuilt apple silicon binary at `KBPu
 
 run as usual:
 
-    sudo python3 motion_live.py
+    python3 motion_live.py
 
 optional overrides:
 
-    sudo python3 motion_live.py --no-kbpulse
-    sudo python3 motion_live.py --kbpulse-bin /path/to/KBPulse
+    python3 motion_live.py --no-kbpulse
+    python3 motion_live.py --kbpulse-bin /path/to/KBPulse
 
 ### with uv
 
 If you have `uv`/`uvx` installed, you can also just
 
-    sudo uvx git+https://github.com/olvvier/apple-silicon-accelerometer.git
+    uvx git+https://github.com/olvvier/apple-silicon-accelerometer.git
 
 ## code structure
 
@@ -285,7 +284,6 @@ the bcg bandpass is 0.8-3hz and bpm is estimated via autocorrelation on the filt
 ## notes
 
 - experimental / undocumented AppleSPU hid path
-- requires sudo
 - may break on future macos updates
 - use at your own risk
 - not for medical use
@@ -300,6 +298,7 @@ the bcg bandpass is 0.8-3hz and bpm is estimated via autocorrelation on the filt
 
 - intel macs (no spu)
 - m1 macbook pro (2020)
+- m2 macbook pro (2023)
 - mac studio m4 max 
 
 
