@@ -1,6 +1,6 @@
 [project]
 name = "macimu"
-version = "0.2.0"
+version = "0.2.1"
 license = "MIT"
 description = "read the undocumented mems accelerometer + gyroscope on apple silicon macs via iokit hid"
 authors = [{ name = "Olivier Bourbonnais", email = "olvvier.b@gmail.com" }]
