@@ -46,9 +46,6 @@ class SensorNotFound(RuntimeError):
 class IMU:
     """High-level interface to the Apple Silicon SPU IMU.
 
-    Requires root privileges (sudo). Spawns a background worker thread
-    that reads HID reports and writes samples to shared memory.
-
     Parameters
     ----------
     accel : bool
@@ -202,8 +199,6 @@ class IMU:
             return
         if self._mock:
             return
-        if os.geteuid() != 0:
-            raise PermissionError("macimu requires root -- run with sudo")
         if not check_available():
             raise SensorNotFound(
                 "no SPU IMU found -- this machine may not have the sensor")
