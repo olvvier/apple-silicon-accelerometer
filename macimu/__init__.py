@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-__version__ = "0.2.0"
+__version__ = "0.2.1"
 
 import atexit
 import csv
@@ -191,6 +191,8 @@ class IMU:
     @property
     def effective_sample_rate(self) -> Optional[float]:
         """Measured sample rate in Hz, or None if not enough data."""
+        if self._mock:
+            return _NATIVE_RATE_HZ / self._decimation
         elapsed = time.monotonic() - self._start_time
         if elapsed < 0.5 or self._sample_count < 10:
             return None
@@ -419,6 +421,26 @@ class IMU:
                 result['orientation'] = o
         return result
 
+    def wait_accel(self, timeout: float = 1.0) -> Optional[Sample]:
+        """Block until next accelerometer sample arrives. Returns Sample or None on timeout."""
+        deadline = time.monotonic() + timeout
+        while self._started and time.monotonic() < deadline:
+            samples = self.read_accel()
+            if samples:
+                return samples[-1]
+            time.sleep(0.002)
+        return None
+
+    def wait_gyro(self, timeout: float = 1.0) -> Optional[Sample]:
+        """Block until next gyroscope sample arrives. Returns Sample or None on timeout."""
+        deadline = time.monotonic() + timeout
+        while self._started and time.monotonic() < deadline:
+            samples = self.read_gyro()
+            if samples:
+                return samples[-1]
+            time.sleep(0.002)
+        return None
+
     def stream_accel(self, interval: float = 0.01) -> Generator[Sample, None, None]:
         """Yield accelerometer samples as they arrive."""
         while self._started:
@@ -496,6 +518,8 @@ class IMU:
                     results.append(TimedSample(t, x, y, z) if timed else Sample(x, y, z))
             else:
                 self._mock_idx += 1
+        if self._mock_idx >= len(self._mock_data):
+            self._started = False
         return results
 
     def _record_samples(self, samples, sensor):
