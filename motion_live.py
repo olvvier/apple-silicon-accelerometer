@@ -669,7 +669,7 @@ def _lid_text(angle):
     return f'  {BWHT}{angle:.0f}°{RST}'
 
 
-_ALS_SPEC_OFFSETS = [20, 24, 28, 32]
+_ALS_SPEC_OFFSETS = [20, 24, 28, 32, 36]
 _ALS_LUX_OFF = 40
 _ALS_BLOCKS = ' ▁▂▃▄▅▆▇█'
 _SPECTRUM_KEYS = [

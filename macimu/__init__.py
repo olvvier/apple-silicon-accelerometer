@@ -34,7 +34,7 @@ from ._spu import (
 from .orientation import MahonyAHRS
 
 _ALS_LUX_OFF = 40
-_ALS_CH_OFFSETS = [20, 24, 28, 32]
+_ALS_CH_OFFSETS = [20, 24, 28, 32, 36]
 _NATIVE_RATE_HZ = 800
 
 
@@ -380,7 +380,7 @@ class IMU:
     def read_als(self) -> Optional[ALSReading]:
         """Return ambient light data, or None if unavailable.
 
-        Returns ALSReading(lux, channels) where channels is a list of 4 ints.
+        Returns ALSReading(lux, channels) where channels is a list of 5 ints.
         """
         if not self._shm_als:
             return None
