@@ -214,7 +214,7 @@ if __name__ == '__main__':
 |--------|---------|-------------|
 | `imu.orientation()` | `Orientation \| None` | roll, pitch, yaw (deg) + quaternion |
 | `imu.read_lid()` | `float \| None` | lid angle in degrees |
-| `imu.read_als()` | `ALSReading \| None` | lux + 4 spectral channels |
+| `imu.read_als()` | `ALSReading \| None` | lux + 5 spectral channels |
 
 **streaming**
 
